@@ -1,0 +1,212 @@
+#!/usr/bin/env python
+import os
+import sys
+import json
+import glob
+import time
+
+
+pkgs = [
+    'api',
+    'core',
+]
+
+# linux.amd64 only
+os.environ.update({
+    "CGO_ENABLED": "0",
+    "GOOS": "linux",
+    "GOARCH": "amd64"
+})
+
+# auto gen build details
+date = time.strftime('%Y%m%d', time.localtime())
+head = os.popen('git rev-parse HEAD').read()
+ldflags = " ".join([
+    '-extldflags -static',
+    '-X main.BuildDate=%s' %  date,
+    '-X main.BuildGitHash=%s' % head
+])
+
+def _get_mod():
+    pwd = os.getcwd()
+    gopath = os.environ.get('GOPATH', '')
+    for path in gopath.split(':'):
+        src = os.path.join(path, 'src/')
+        if not pwd.startswith(src):
+            continue
+
+        return pwd.replace(src, '', 1)
+    raise Exception('mod not found, check your GOPATH')
+
+
+def _get_version():
+    for line in open('main.go'):
+        line = line.strip()
+        if not line.startswith('version'):
+            continue
+
+        items = map(lambda x:x.strip(), line.split('='))
+        if len(items) != 2 or items[0] != 'version':
+            continue
+
+        return items[1].strip('"')
+
+
+def _get_name():
+    js = json.loads(open('config.json').read())
+    return js['name']
+
+
+def _sed(path, old, new):
+    s = open(path).read()
+    s = s.replace(old, new, -1)
+    open(path, 'wb').write(s)
+
+
+def _run(cmd):
+    print 'running: %s' % cmd
+    code = os.system(cmd)
+    print 'finish: %s' % code
+
+
+def version():
+    return _get_version()
+
+
+def name():
+    print _get_name()
+
+
+def remodule():
+    if os.environ.get('GO111MODULE', '') != 'on':
+        print 'GO111MODULE not on.'
+        return
+
+    if not os.path.exists('go.mod'):
+        print 'go.mod not found.'
+        return
+
+    oldmod = open('go.mod').readline().split()[1].strip()
+    newmod = _get_mod()
+    if newmod is None:
+        print 'outside GOPATH, can not remodule.'
+        return
+
+    if oldmod == newmod:
+        print 'It is already %s, nothing to do.' % newmod
+        return
+
+    oldpkgs = map(lambda pkg: oldmod + '/' + pkg, pkgs)
+    newpkgs = map(lambda pkg: newmod + '/' + pkg, pkgs)
+
+    o_n = zip(oldpkgs, newpkgs)
+
+    allgo = ['main.go']
+    for pkg in pkgs:
+        gos = glob.glob('%s/*.go' % pkg)
+        for go in gos:
+            allgo.append(go)
+
+    for go in allgo:
+        for old, new in o_n:
+            _sed(go, old, new)
+
+    _sed('go.mod', oldmod, newmod)
+    print 'Done %s -> %s.' % (oldmod, newmod)
+
+
+def build():
+    cmds = [
+        'mkdir -p dist',
+        'go build -mod=vendor -ldflags "%s" -o dist/%s %s' % (ldflags, _get_name(), os.getcwd()),
+    ]
+    map(_run, cmds)
+    print 'Done'
+
+
+def buildweb():
+    cmds = [
+        'cd web && yarn install && npm run build'
+    ]
+    map(_run, cmds)
+    print 'Done'
+
+
+def pack():
+    build()
+    name = _get_name()
+    version = _get_version()
+    app = os.path.join('dist', name)
+    dist = os.path.join('dist', '%s-%s.tar.gz' % (name, version))
+    files = " ".join([app, 'config.json'])
+
+    cmds = [
+        'tar -zcf %s %s' % (dist, files)
+    ]
+    map(_run, cmds)
+
+    print 'name: %s' % name
+    print 'version: %s' % version
+    print 'pack: %s' %  dist
+
+
+def packall():
+    build()
+    name = _get_name()
+    version = _get_version()
+    app = os.path.join('dist', name)
+    dist = os.path.join('dist', '%s-%s.tar.gz' % (name, version))
+    files = " ".join([app, 'config.json', 'docs', 'web/dist'])
+
+    cmds = [
+        'tar -zcf %s %s' % (dist, files)
+    ]
+    map(_run, cmds)
+
+    print 'name: %s' % name
+    print 'version: %s' % version
+    print 'pack: %s' %  dist
+
+
+def clean():
+    os.system('rm -rf dist/*')
+
+
+def apidoc():
+    cmds = [
+        'apidoc -i api/ -o docs/'
+    ]
+
+    map(_run, cmds)
+    print 'Done'
+
+
+if __name__ == '__main__':
+    import sys, inspect
+    if len(sys.argv) < 2:
+        print "Usage:"
+        for k, v in sorted(globals().items(), key=lambda item: item[0]):
+            if inspect.isfunction(v) and k[0] != "_":
+                args, __, __, defaults = inspect.getargspec(v)
+                if defaults:
+                    print sys.argv[0], k, str(args[:-len(defaults)])[1:-1].replace(",", ""), \
+                          str(["%s=%s" % (a, b) for a, b in zip(args[-len(defaults):], defaults)])[1:-1].replace(",", "")
+                else:
+                    print sys.argv[0], k, str(v.func_code.co_varnames[:v.func_code.co_argcount])[1:-1].replace(",", "")
+        sys.exit(-1)
+    else:
+        func = eval(sys.argv[1])
+        args = sys.argv[2:]
+        try:
+            r = func(*args)
+        except Exception, e:
+            print "Usage:"
+            print "\t", "python %s" % sys.argv[1], str(func.func_code.co_varnames[:func.func_code.co_argcount])[1:-1].replace(",", "")
+            if func.func_doc:
+                print "\n".join(["\t\t" + line.strip() for line in func.func_doc.strip().split("\n")])
+            print e
+            r = -1
+            import traceback
+            traceback.print_exc()
+        if isinstance(r, int):
+            sys.exit(r)
